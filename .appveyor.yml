@@ -19,9 +19,6 @@ cache:
 before_build:
   - del "C:\Program Files (x86)\MSBuild\14.0\Microsoft.Common.targets\ImportAfter\Xamarin.Common.targets"
 
-build:
-  parallel: true
-
 build_script:
     # enable calling pip directly
   - cmd: set PATH=%SystemDrive%\Python27\Scripts;%PATH%

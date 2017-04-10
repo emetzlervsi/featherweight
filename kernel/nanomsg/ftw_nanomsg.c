@@ -1,5 +1,5 @@
 /*
-    Copyright (c) 2014-2016 Wirebird Labs LLC. All rights reserved.
+    Copyright (c) 2014-2017 Wirebird Labs LLC. All rights reserved.
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"),
@@ -22,46 +22,43 @@
 
 #include "ftw_nanomsg.h"
 
+#include "upstream/src/reqrep.h"
 #include "upstream/src/pubsub.h"
 #include "upstream/src/pipeline.h"
 
 FTW_PRIVATE_SUPPORT void ftw_subscriber_async_recv_thread(void *arg);
 FTW_PRIVATE_SUPPORT void ftw_nanomsg_shutdown_active_sockets(struct ftw_socket_callsite *inst);
-FTW_PRIVATE_SUPPORT int ftw_socket_close(struct ftw_socket * const sock);
+FTW_PRIVATE_SUPPORT ftwrc ftw_socket_close(struct ftw_socket * const sock);
+FTW_PRIVATE_SUPPORT ftwrc ftw_socket_destroy(struct ftw_socket ** const sock);
 
-int ftw_nanomsg_error(LStrHandle error_message)
+void ftw_nanomsg_error(LStrHandle message, int64 *code)
 {
     const char *human_readable_error;
-    int current_error;
 
-    current_error = errno;
+    if (*code == 0) {
+        return;
+    }
 
     /*  The FTW library will explicitly handle a few errors, since "socket"
         could be a less misleading term than "file descriptors". */
-    switch (current_error) {
+    switch (*code) {
     case EBADF:
         human_readable_error = "Invalid socket";
         break;
     case EMFILE:
         human_readable_error = "Too many open sockets";
         break;
+    case EBUSY:
+        human_readable_error = "Resource busy";
+        break;
     default:
-        human_readable_error = nn_strerror(current_error);
+        human_readable_error = nn_strerror((int)*code);
         break;
     }
 
-    ftw_support_CStr_to_LStrHandle(&error_message, human_readable_error, 1024);
+    ftw_support_CStr_to_LStrHandle(&message, human_readable_error, 1024);
 
-    return current_error;
-}
-
-int ftw_nanomsg_setsockopt(const int socket_id, int level, int option, const void *value, size_t length)
-{
-    int rc;
-
-    rc = nn_setsockopt(socket_id, level, option, value, length);
-
-    return rc;
+    return;
 }
 
 static void ftw_subscriber_async_recv_thread(void *arg)
@@ -69,7 +66,7 @@ static void ftw_subscriber_async_recv_thread(void *arg)
     LStrHandle msg_sent_to_lv;
     struct ftw_socket *self;
     void *recv_buf;
-    MgErr lv_err;
+    ftwrc lvrc;
     int socket_err;
     int rc;
 
@@ -77,24 +74,24 @@ static void ftw_subscriber_async_recv_thread(void *arg)
 
     /*  Create local pointer to arguments and notify launching process this thread is constructed. */
     self = ((struct ftw_socket *) arg);
-    nn_sem_post(&self->async_recv_ready);
+    uv_sem_post(&self->async_recv_ready);
 
-    lv_err = mgNoErr;
-    socket_err = 0;
+    lvrc = EFTWOK;
+    socket_err = EFTWOK;
 
     /*  This broker relays messages from the nanomsg socket into the LabVIEW incoming message queue. */
-    while (!lv_err && !socket_err) {
+    while (lvrc == EFTWOK && socket_err == EFTWOK) {
 
         rc = nn_recv(self->id, &recv_buf, NN_MSG, 0);
 
         if (rc < 0) {
-            socket_err = ((errno == ETIMEDOUT || errno == EAGAIN) ? 0 : errno);
+            socket_err = ((errno == ETIMEDOUT || errno == EAGAIN) ? EFTWOK : errno);
             continue;
         }
 
         msg_sent_to_lv = (LStrHandle)DSNewHandle(rc);
-        lv_err = ftw_support_buffer_to_LStrHandle(&msg_sent_to_lv, recv_buf, rc);
-        if (lv_err)
+        lvrc = ftw_support_buffer_to_LStrHandle(&msg_sent_to_lv, recv_buf, rc, 0);
+        if (lvrc)
             continue;
 
         /*  On the LabVIEW side, the handler is a an event registration, meaning
@@ -103,11 +100,11 @@ static void ftw_subscriber_async_recv_thread(void *arg)
             the Publisher, yet this consideration has long-existed for the LabVIEW
             developer (since, LV-native primitives will likewise cause a memory leak,
             when Event Registrations are allowed to grow without bound). */
-        lv_err = PostLVUserEvent(self->incoming_msg_notifier_event, &msg_sent_to_lv);
-        if (lv_err)
+        lvrc = PostLVUserEvent(self->incoming_msg_notifier_event, &msg_sent_to_lv);
+        if (lvrc)
             continue;
 
-        lv_err = DSDisposeHandle (msg_sent_to_lv);
+        lvrc = DSDisposeHandle (msg_sent_to_lv);
         rc = nn_freemsg(recv_buf);
         if (rc) {
             socket_err = errno;
@@ -118,144 +115,8 @@ static void ftw_subscriber_async_recv_thread(void *arg)
     return;
 }
 
-int ftw_nanomsg_sync_server_start(struct ftw_socket_callsite **callsite,
-    const char *addr, int linger, int max_recv_size, struct ftw_socket **sock)
-{
-    struct ftw_socket *inst;
-    int rcb;
-    int rcs;
-    int rco;
-
-    /*  Preconditions expected of LabVIEW. */
-    ftw_assert(*callsite && addr);
-    nn_mutex_lock(&(*callsite)->sync);
-
-    rcs = nn_socket(AF_SP, NN_REP);
-
-    /*  Socket creation failure? */
-    if (rcs < 0) {
-        *sock = NULL;
-        nn_mutex_unlock(&(*callsite)->sync);
-        return rcs;
-    }
-
-    rco = nn_setsockopt(rcs, NN_SOL_SOCKET, NN_LINGER, &linger, sizeof(linger));
-    if (rco < 0) {
-        *sock = NULL;
-        nn_mutex_unlock(&(*callsite)->sync);
-        return rco;
-    }
-
-    rco = nn_setsockopt(rcs, NN_SOL_SOCKET, NN_RCVMAXSIZE, &max_recv_size, sizeof(max_recv_size));
-    if (rco < 0) {
-        *sock = NULL;
-        nn_mutex_unlock(&(*callsite)->sync);
-        return rco;
-    }
-
-    rcb = nn_bind(rcs, addr);
-
-    /*  Endpoint creation failure? */
-    if (rcb < 0) {
-        nn_close(rcs);
-        *sock = NULL;
-        nn_mutex_unlock(&(*callsite)->sync);
-        return rcb;
-    }
-
-    inst = ftw_malloc(sizeof(struct ftw_socket));
-    ftw_assert(inst);
-
-    memset(inst, 0, sizeof(*inst));
-
-    inst->id = rcs;
-    inst->callsite = *callsite;
-
-    nn_list_item_init(&inst->item);
-    nn_list_insert(&(*callsite)->active_sockets, &inst->item,
-        nn_list_end(&(*callsite)->active_sockets));
-
-    *sock = inst;
-
-    (*callsite)->lifetime_sockets++;
-    nn_mutex_unlock(&(*callsite)->sync);
-
-    return 0;
-}
-
-int ftw_nanomsg_sync_server_await(struct ftw_socket ** const sock,
-    const int timeout, LStrHandle request)
-{
-    struct ftw_socket const *s;
-    MgErr lv_err;
-    void *recv_buf;
-    int rc;
-
-    s = *sock;
-    if (s == NULL) {
-        errno = EBADF;
-        return -1;
-    }
-
-    rc = nn_setsockopt(s->id, NN_SOL_SOCKET, NN_RCVTIMEO, &timeout, sizeof(timeout));
-    if (rc < 0)
-        return rc;
-
-    recv_buf = NULL;
-
-    rc = nn_recv(s->id, &recv_buf, NN_MSG, 0);
-
-    if (rc < 0) {
-        ftw_assert (recv_buf == NULL);
-        return rc;
-    }
-
-    lv_err = ftw_support_buffer_to_LStrHandle(&request, recv_buf, rc);
-
-    if (lv_err) {
-        errno = lv_err + LV_USER_ERROR;
-        rc = -1;
-    }
-
-    if (recv_buf)
-        nn_freemsg(recv_buf);
-
-    return rc;
-}
-
-int ftw_nanomsg_sync_server_reply(struct ftw_socket ** const sock,
-    const int timeout, const LStrHandle response)
-{
-    struct ftw_socket const *s;
-    const void *msg;
-    size_t len;
-    int rc;
-
-    s = *sock;
-    if (s == NULL) {
-        errno = EBADF;
-        return -1;
-    }
-
-    rc = nn_setsockopt(s->id, NN_SOL_SOCKET, NN_SNDTIMEO, &timeout, sizeof(timeout));
-    if (rc < 0)
-        return rc;
-
-    msg = LHStrBuf(response);
-    len = LHStrLen(response);
-
-    rc = nn_send(s->id, msg, len, 0);
-
-    return rc;
-}
-
-int ftw_nanomsg_sync_server_stop(struct ftw_socket ** const sock)
-{
-    return ftw_socket_destroy(sock);
-}
-
-int ftw_nanomsg_connector_connect(struct ftw_socket_callsite **callsite, const char *addr,
-    int linger, int max_recv_size, struct ftw_socket **sock)
+ftwrc ftw_actor_connector_connect(struct ftw_socket_callsite **callsite, const char *addr,
+    int max_recv_size, struct ftw_socket **sock)
 {
     struct ftw_socket *inst;
     int rcs;
@@ -264,29 +125,23 @@ int ftw_nanomsg_connector_connect(struct ftw_socket_callsite **callsite, const c
 
     /*  Preconditions expected of LabVIEW. */
     ftw_assert(*callsite && addr);
-    nn_mutex_lock(&(*callsite)->sync);
+    uv_mutex_lock(&(*callsite)->lock);
 
     rcs = nn_socket(AF_SP, NN_REQ);
 
     /*  Socket creation failure? */
     if (rcs < 0) {
         *sock = NULL;
-        nn_mutex_unlock(&(*callsite)->sync);
-        return rcs;
-    }
-
-    rco = nn_setsockopt(rcs, NN_SOL_SOCKET, NN_LINGER, &linger, sizeof(linger));
-    if (rco < 0) {
-        *sock = NULL;
-        nn_mutex_unlock(&(*callsite)->sync);
-        return rco;
+        uv_mutex_unlock(&(*callsite)->lock);
+        return errno;
     }
 
     rco = nn_setsockopt(rcs, NN_SOL_SOCKET, NN_RCVMAXSIZE, &max_recv_size, sizeof(max_recv_size));
     if (rco < 0) {
+        nn_close(rcs);
         *sock = NULL;
-        nn_mutex_unlock(&(*callsite)->sync);
-        return rco;
+        uv_mutex_unlock(&(*callsite)->lock);
+        return errno;
     }
 
     rcc = nn_connect(rcs, addr);
@@ -295,12 +150,17 @@ int ftw_nanomsg_connector_connect(struct ftw_socket_callsite **callsite, const c
     if (rcc < 0) {
         nn_close(rcs);
         *sock = NULL;
-        nn_mutex_unlock(&(*callsite)->sync);
-        return rcc;
+        uv_mutex_unlock(&(*callsite)->lock);
+        return errno;
     }
 
     inst = ftw_malloc(sizeof(struct ftw_socket));
-    ftw_assert(inst);
+    if (inst == NULL) {
+        nn_close(rcs);
+        *sock = NULL;
+        uv_mutex_unlock(&(*callsite)->lock);
+        return ENOMEM;
+    }
 
     memset(inst, 0, sizeof(*inst));
 
@@ -314,27 +174,29 @@ int ftw_nanomsg_connector_connect(struct ftw_socket_callsite **callsite, const c
     *sock = inst;
 
     (*callsite)->lifetime_sockets++;
-    nn_mutex_unlock(&(*callsite)->sync);
+    uv_mutex_unlock(&(*callsite)->lock);
 
-    return 0;
+    return EFTWOK;
 
 }
 
-int ftw_nanomsg_connector_ask(struct ftw_socket ** const sock, int send_timeout,
+ftwrc ftw_actor_connector_ask(struct ftw_socket ** const sock, int send_timeout,
     int recv_timeout, const LStrHandle request, LStrHandle response)
 {
-    int rc;
+    struct ftw_socket const *s;
     struct nn_iovec iov;
     struct nn_msghdr hdr;
     void *recv_buf;
-    MgErr resize_err;
-    struct ftw_socket const *s;
+    ftwrc allocrc;
+    int rc;
+
+    /*  Preconditions expected of LabVIEW. */
+    ftw_assert(*sock && LHStrBuf(request) && LHStrBuf(response));
 
     s = *sock;
 
     if (s == NULL) {
-        errno = EBADF;
-        return -1;
+        return EBADF;
     }
 
     iov.iov_base = LHStrBuf(request);
@@ -346,73 +208,66 @@ int ftw_nanomsg_connector_ask(struct ftw_socket ** const sock, int send_timeout,
     hdr.msg_controllen = 0;
 
     rc = nn_setsockopt(s->id, NN_SOL_SOCKET, NN_SNDTIMEO, &send_timeout, sizeof(send_timeout));
-    if (rc < 0)
-        return rc;
-
-    rc = nn_setsockopt(s->id, NN_SOL_SOCKET, NN_RCVTIMEO, &recv_timeout, sizeof(recv_timeout));
-    if (rc < 0)
-        return rc;
-
-    rc = nn_sendmsg(s->id, &hdr, 0);
-
-    if (rc >= 0) {
-        recv_buf = NULL;
-        iov.iov_base = &recv_buf;
-        iov.iov_len = NN_MSG;
-
-        hdr.msg_iov = &iov;
-        hdr.msg_iovlen = 1;
-        hdr.msg_control = NULL;
-        hdr.msg_controllen = 0;
-
-        rc = nn_recvmsg(s->id, &hdr, 0);
-
-        if (rc >= 0) {
-            resize_err = ftw_support_buffer_to_LStrHandle(&response, recv_buf, rc);
-            if (resize_err != mgNoErr) {
-                errno = resize_err + LV_USER_ERROR;
-                rc = -1;
-            }
-        }
-
-        if (recv_buf)
-            nn_freemsg(recv_buf);
+    if (rc < 0) {
+        return errno;
     }
 
-    return rc;
+    rc = nn_setsockopt(s->id, NN_SOL_SOCKET, NN_RCVTIMEO, &recv_timeout, sizeof(recv_timeout));
+    if (rc < 0) {
+        return errno;
+    }
+
+    rc = nn_sendmsg(s->id, &hdr, 0);
+    if (rc < 0) {
+        return errno;
+    }
+
+    recv_buf = NULL;
+    iov.iov_base = &recv_buf;
+    iov.iov_len = NN_MSG;
+
+    hdr.msg_iov = &iov;
+    hdr.msg_iovlen = 1;
+    hdr.msg_control = NULL;
+    hdr.msg_controllen = 0;
+
+    rc = nn_recvmsg(s->id, &hdr, 0);
+    if (rc < 0) {
+        ftw_assert(recv_buf == NULL);
+        ftw_assert(errno);
+        return errno;
+    }
+
+    allocrc = ftw_support_buffer_to_LStrHandle(&response, recv_buf, rc, 0);
+
+    ftw_assert_ok(nn_freemsg(recv_buf));
+
+    return allocrc;
 }
 
-int ftw_nanomsg_connector_disconnect(struct ftw_socket ** const sock)
+ftwrc ftw_actor_connector_disconnect(struct ftw_socket ** const sock)
 {
     return ftw_socket_destroy(sock);
 }
 
-int ftw_publisher_construct(struct ftw_socket_callsite **callsite, const char *addr,
-    int linger, struct ftw_socket **sock)
+ftwrc ftw_publisher_construct(struct ftw_socket_callsite **callsite, const char *addr,
+    struct ftw_socket **sock)
 {
     struct ftw_socket *inst;
     int rcs;
-    int rco;
     int rcb;
 
     /*  Preconditions expected of LabVIEW. */
     ftw_assert(*callsite && addr);
-    nn_mutex_lock(&(*callsite)->sync);
+    uv_mutex_lock(&(*callsite)->lock);
 
     rcs = nn_socket(AF_SP, NN_PUB);
 
     /*  Socket creation failure? */
     if (rcs < 0) {
         *sock = NULL;
-        nn_mutex_unlock(&(*callsite)->sync);
-        return rcs;
-    }
-
-    rco = nn_setsockopt(rcs, NN_SOL_SOCKET, NN_LINGER, &linger, sizeof(linger));
-    if (rco < 0) {
-        *sock = NULL;
-        nn_mutex_unlock(&(*callsite)->sync);
-        return rco;
+        uv_mutex_unlock(&(*callsite)->lock);
+        return errno;
     }
 
     rcb = nn_bind(rcs, addr);
@@ -421,12 +276,17 @@ int ftw_publisher_construct(struct ftw_socket_callsite **callsite, const char *a
     if (rcb < 0) {
         nn_close(rcs);
         *sock = NULL;
-        nn_mutex_unlock(&(*callsite)->sync);
-        return rcb;
+        uv_mutex_unlock(&(*callsite)->lock);
+        return errno;
     }
 
     inst = ftw_malloc(sizeof(struct ftw_socket));
-    ftw_assert(inst);
+    if (inst == NULL) {
+        nn_close(rcs);
+        *sock = NULL;
+        uv_mutex_unlock(&(*callsite)->lock);
+        return ENOMEM;
+    }
 
     memset(inst, 0, sizeof(*inst));
 
@@ -440,13 +300,12 @@ int ftw_publisher_construct(struct ftw_socket_callsite **callsite, const char *a
     *sock = inst;
 
     (*callsite)->lifetime_sockets++;
-    nn_mutex_unlock(&(*callsite)->sync);
+    uv_mutex_unlock(&(*callsite)->lock);
 
-    return 0;
-
+    return EFTWOK;
 }
 
-int ftw_publisher_publish(struct ftw_socket ** const sock, int send_timeout, ConstLStrH message)
+ftwrc ftw_publisher_publish(struct ftw_socket ** const sock, int send_timeout, ConstLStrH message)
 {
     struct ftw_socket const *s;
     int rc;
@@ -456,28 +315,28 @@ int ftw_publisher_publish(struct ftw_socket ** const sock, int send_timeout, Con
     s = *sock;
 
     if (s == NULL) {
-        errno = EBADF;
-        return -1;
+        return EBADF;
     }
 
     buf = LHStrBuf(message);
     len = LHStrLen(message);
 
     rc = nn_setsockopt(s->id, NN_SOL_SOCKET, NN_SNDTIMEO, &send_timeout, sizeof(send_timeout));
-    if (rc < 0)
-        return rc;
+    if (rc < 0) {
+        return errno;
+    }
 
     rc = nn_send(s->id, buf, len, 0);
 
-    return rc;
+    return (rc ? errno : EFTWOK);
 }
 
-int ftw_publisher_destroy(struct ftw_socket ** const sock)
+ftwrc ftw_publisher_destroy(struct ftw_socket ** const sock)
 {
     return ftw_socket_destroy(sock);
 }
 
-int ftw_subscriber_construct(struct ftw_socket_callsite **callsite, LVUserEventRef *lv_event,
+ftwrc ftw_subscriber_construct(struct ftw_socket_callsite **callsite, LVUserEventRef *lv_event,
     const char *addr, int linger, int max_recv_size, struct ftw_socket **sock)
 {
     struct ftw_socket *inst;
@@ -487,29 +346,31 @@ int ftw_subscriber_construct(struct ftw_socket_callsite **callsite, LVUserEventR
 
     /*  Preconditions expected of LabVIEW. */
     ftw_assert(*callsite && addr);
-    nn_mutex_lock(&(*callsite)->sync);
+    uv_mutex_lock(&(*callsite)->lock);
 
     rcs = nn_socket(AF_SP, NN_SUB);
 
     /*  Socket creation failure? */
     if (rcs < 0) {
         *sock = NULL;
-        nn_mutex_unlock(&(*callsite)->sync);
-        return rcs;
+        uv_mutex_unlock(&(*callsite)->lock);
+        return errno;
     }
 
     rco = nn_setsockopt(rcs, NN_SOL_SOCKET, NN_LINGER, &linger, sizeof(linger));
     if (rco < 0) {
+        nn_close(rcs);
         *sock = NULL;
-        nn_mutex_unlock(&(*callsite)->sync);
-        return rco;
+        uv_mutex_unlock(&(*callsite)->lock);
+        return errno;
     }
 
     rco = nn_setsockopt(rcs, NN_SOL_SOCKET, NN_RCVMAXSIZE, &max_recv_size, sizeof(max_recv_size));
     if (rco < 0) {
+        nn_close(rcs);
         *sock = NULL;
-        nn_mutex_unlock(&(*callsite)->sync);
-        return rco;
+        uv_mutex_unlock(&(*callsite)->lock);
+        return errno;
     }
 
     rcc = nn_connect(rcs, addr);
@@ -518,20 +379,25 @@ int ftw_subscriber_construct(struct ftw_socket_callsite **callsite, LVUserEventR
     if (rcc < 0) {
         nn_close(rcs);
         *sock = NULL;
-        nn_mutex_unlock(&(*callsite)->sync);
-        return rcc;
+        uv_mutex_unlock(&(*callsite)->lock);
+        return errno;
     }
 
     rco = nn_setsockopt (rcs, NN_SUB, NN_SUB_SUBSCRIBE, "", 0);
     if (rco < 0) {
         nn_close(rcs);
         *sock = NULL;
-        nn_mutex_unlock(&(*callsite)->sync);
-        return rco;
+        uv_mutex_unlock(&(*callsite)->lock);
+        return errno;
     }
 
     inst = ftw_malloc(sizeof(struct ftw_socket));
-    ftw_assert(inst);
+    if (inst == NULL) {
+        nn_close(rcs);
+        *sock = NULL;
+        uv_mutex_unlock(&(*callsite)->lock);
+        return ENOMEM;
+    }
 
     inst->incoming_msg_notifier_event = *lv_event;
     inst->id = rcs;
@@ -541,68 +407,64 @@ int ftw_subscriber_construct(struct ftw_socket_callsite **callsite, LVUserEventR
     nn_list_insert(&(*callsite)->active_sockets, &inst->item,
         nn_list_end(&(*callsite)->active_sockets));
 
-    nn_sem_init(&inst->msg_acknowledged);
-
     /*  Launch thread and wait for it to initialize. */
-    nn_sem_init(&inst->async_recv_ready);
-    nn_thread_init(&inst->async_recv_thread, ftw_subscriber_async_recv_thread, inst);
-    nn_sem_wait(&inst->async_recv_ready);
+    ftw_assert_ok(uv_sem_init(&inst->async_recv_ready, 0));
+    uv_thread_create(&inst->async_recv_thread, ftw_subscriber_async_recv_thread, inst);
+    uv_sem_wait(&inst->async_recv_ready);
 
     *sock = inst;
 
     (*callsite)->lifetime_sockets++;
-    nn_mutex_unlock(&(*callsite)->sync);
+    uv_mutex_unlock(&(*callsite)->lock);
 
-    return 0;
+    return EFTWOK;
 }
 
-int ftw_subscriber_destroy(struct ftw_socket ** const sock)
+ftwrc ftw_subscriber_destroy(struct ftw_socket ** const sock)
 {
     return ftw_socket_destroy(sock);
 }
 
-int ftw_socket_close(struct ftw_socket * const sock)
+ftwrc ftw_socket_close(struct ftw_socket * const sock)
 {
-    int rc;
+    ftwrc rc;
 
     /*  Preconditions expected of LabVIEW. */
     ftw_assert(sock);
 
     rc = nn_close(sock->id);
-    if (rc != 0) {
-        return rc;
+    if (rc != EFTWOK) {
+        return errno;
     }
 
     /*  A non-NULL Dynamic Event Reference means this socket has an asynchronous recv thread that must shut down. */
     if (sock->incoming_msg_notifier_event) {
-        nn_thread_term(&sock->async_recv_thread);
-        nn_sem_term(&sock->async_recv_ready);
-        nn_sem_term(&sock->msg_acknowledged);
+        ftw_assert_ok(uv_thread_join(&sock->async_recv_thread));
+        uv_sem_destroy(&sock->async_recv_ready);
     }
 
-    return 0;
+    return EFTWOK;
 }
 
-int ftw_socket_destroy(struct ftw_socket ** const sock)
+ftwrc ftw_socket_destroy(struct ftw_socket ** const sock)
 {
-    int rc;
+    ftwrc rc;
 
     /*  Preconditions expected of LabVIEW. */
     ftw_assert(sock);
 
     if (*sock == NULL) {
-        errno = EBADF;
-        return -1;
+        return EBADF;
     }
 
-    nn_mutex_lock(&(*sock)->callsite->sync);
+    uv_mutex_lock(&(*sock)->callsite->lock);
     rc = ftw_socket_close(*sock);
     nn_list_erase(&(*sock)->callsite->active_sockets, &(*sock)->item);
-    nn_mutex_unlock(&(*sock)->callsite->sync);
-    ftw_assert(ftw_free(*sock) == mgNoErr);
+    uv_mutex_unlock(&(*sock)->callsite->lock);
+    ftw_assert_ok(ftw_free(*sock));
     *sock = NULL;
 
-    return rc;
+    return (rc ? errno : EFTWOK);
 }
 
 MgErr ftw_nanomsg_reserve(struct ftw_socket_callsite **inst)
@@ -617,13 +479,15 @@ MgErr ftw_nanomsg_reserve(struct ftw_socket_callsite **inst)
         callsite++;
         ftw_debug("Reserving Socket Creation Callsite %d", callsite);
         *inst = ftw_malloc(sizeof(struct ftw_socket_callsite));
-        ftw_assert(*inst);
-        nn_mutex_init(&(*inst)->sync);
-        nn_mutex_lock(&(*inst)->sync);
+        if(*inst == NULL) {
+            return mZoneErr;
+        }
+        ftw_assert_ok(uv_mutex_init(&(*inst)->lock));
+        uv_mutex_lock(&(*inst)->lock);
         nn_list_init(&(*inst)->active_sockets);
         (*inst)->id = callsite;
         (*inst)->lifetime_sockets = 0;
-        nn_mutex_unlock(&(*inst)->sync);
+        uv_mutex_unlock(&(*inst)->lock);
     }
     else {
         ftw_assert_unreachable("Reserve happened twice; this is a problem with LabVIEW.");
@@ -639,9 +503,9 @@ MgErr ftw_nanomsg_unreserve(struct ftw_socket_callsite **inst)
 
     if (*inst) {
         ftw_nanomsg_shutdown_active_sockets(*inst);
-        nn_mutex_term(&(*inst)->sync);
+        uv_mutex_destroy(&(*inst)->lock);
         ftw_debug("Unreserving Socket %d", (*inst)->id);
-        ftw_assert(ftw_free(*inst) == mgNoErr);
+        ftw_assert_ok(ftw_free(*inst));
 
         /*  LabVIEW retains the lifetime of this pointer for each session. For this reason,
             NULL its value so that it does not continue to point to freed memory. */
@@ -671,7 +535,7 @@ void ftw_nanomsg_shutdown_active_sockets(struct ftw_socket_callsite *callsite)
 
     /*  Preconditions expected of LabVIEW. */
     ftw_assert(callsite);
-    nn_mutex_lock(&callsite->sync);
+    uv_mutex_lock(&callsite->lock);
 
     ftw_debug("Shutting down sockets from Callsite %d", callsite->id);
 
@@ -684,7 +548,7 @@ void ftw_nanomsg_shutdown_active_sockets(struct ftw_socket_callsite *callsite)
     }
 
     nn_list_term(&callsite->active_sockets);
-    nn_mutex_unlock(&callsite->sync);
+    uv_mutex_unlock(&callsite->lock);
 
     return;
 }

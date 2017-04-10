@@ -1,5 +1,5 @@
 /*
-    Copyright (c) 2014-2016 Wirebird Labs LLC. All rights reserved.
+    Copyright (c) 2014-2017 Wirebird Labs LLC. All rights reserved.
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"),
@@ -28,6 +28,14 @@ extern "C" {
 #endif
 
 #include "ftw.h"
+
+#ifndef ssize_t
+#define ssize_t intptr_t
+#endif
+#ifndef _SSIZE_T_DEFINED
+#define _SSIZE_T_DEFINED
+#endif
+
 #include "libuv/include/uv.h"
 
 /*  InstanceDataPtr types for libuv callsites that create an event loop. */
@@ -62,9 +70,9 @@ FTW_EXPORT MgErr ftw_libuv_reserve(struct ftw_libuv_callsite **inst);
 FTW_EXPORT MgErr ftw_libuv_unreserve(struct ftw_libuv_callsite **inst);
 FTW_EXPORT MgErr ftw_libuv_abort(struct ftw_libuv_callsite **inst);
 
-FTW_EXPORT MgErr ftw_libuv_error(int *err_number, LStrHandle error_name, LStrHandle error_message);
-FTW_EXPORT MgErr ftw_libuv_version(LStrHandle version);
-FTW_EXPORT MgErr ftw_libuv_lib_path(LStrHandle path);
+FTW_EXPORT void ftw_libuv_error(int *err_number, LStrHandle error_name, LStrHandle error_message);
+FTW_EXPORT ftwrc ftw_libuv_version(LStrHandle version);
+FTW_EXPORT ftwrc ftw_libuv_lib_path(LStrHandle path);
 FTW_EXPORT void ftw_high_resolution_time(uint64_t *nanoseconds);
 
 FTW_EXPORT int ftw_libuv_spawn_process(struct ftw_libuv_callsite **callsite, LVUserEventRef *lv_event,

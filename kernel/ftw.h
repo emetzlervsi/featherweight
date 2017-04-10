@@ -1,5 +1,5 @@
 /*
-    Copyright (c) 2014-2016 Wirebird Labs LLC. All rights reserved.
+    Copyright (c) 2014-2017 Wirebird Labs LLC. All rights reserved.
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"),
@@ -35,10 +35,21 @@ extern "C" {
 
 #include "extcode.h"
 
+#define FTW_VERSION_TEXT "0.10.3"
+
 #define FTW_DEBUG_WINDOW 0
-#define LV_USER_ERROR 5000
 
 #define FTW_NaN NAN
+
+/*  FTW Kernel error codes. */
+#define EFTWOK         0x00000000
+#define EFTWBASE       0xBAD00000
+#define ELVMGRBASE     0xBAD10000
+
+#define EFTWARG        0xBAD00001
+#define EFTWNOMEM      0xBAD00002
+#define EFTWBOGUS      0xBAD04242
+
 
 /*  Featherweight export declarations. */
 #if defined _WIN32
@@ -81,6 +92,8 @@ extern "C" {
             fflush (stderr);\
             abort ();\
        } while (0)
+#define ftw_assert_ok(x) ftw_assert(x == EFTWOK)
+
 
 /*  Compile-time assert (adopted from nanomsg). */
 #define FTW_CTASSERT_2(prefix, line) prefix##line
@@ -109,16 +122,21 @@ typedef struct {
     int32 element[1];
 } int32Array;
 
+/*  FTW-specific return code type. LabVIEW does not define the size of an "int", but it
+    does define the size of "a pointer-sized integer", so this opaque type exists to bridge
+    that gap. */
+typedef intptr_t ftwrc;
+
 /*  Featherweight support functions. */
-char * ftw_support_LStrHandle_to_CStr(LStrHandle src);
-MgErr ftw_support_buffer_to_LStrHandle(LStrHandle *dest, const void *src, size_t length);
-MgErr ftw_support_CStr_to_LStrHandle(LStrHandle *dest, const char *src, size_t max_length);
-MgErr ftw_support_expand_LStrHandleArray(LStrHandleArray ***arr, size_t elements);
-MgErr ftw_support_expand_PointerArray(PointerArray ***arr, size_t elements);
-MgErr ftw_support_expand_int32Array(int32Array ***arr, size_t elements);
+char *ftw_support_LStrHandle_to_CStr(LStrHandle src);
+ftwrc ftw_support_buffer_to_LStrHandle(LStrHandle *dest, const void *src, size_t length, size_t offset);
+ftwrc ftw_support_CStr_to_LStrHandle(LStrHandle *dest, const char *src, size_t max_length);
+ftwrc ftw_support_expand_LStrHandleArray(LStrHandleArray ***arr, size_t elements);
+ftwrc ftw_support_expand_PointerArray(PointerArray ***arr, size_t elements);
+ftwrc ftw_support_expand_int32Array(int32Array ***arr, size_t elements);
 #define ftw_recover_LStrHandle(ptr) (ptr ? (LStrHandle)DSRecoverHandle(ptr - Offset(LStr, str[0])) : NULL)
 void *ftw_malloc(size_t sz);
-MgErr ftw_free(void *ptr);
+ftwrc ftw_free(void *ptr);
 
 #ifdef __cplusplus
 }

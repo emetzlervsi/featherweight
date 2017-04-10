@@ -1,5 +1,5 @@
 /*
-    Copyright (c) 2014-2016 Wirebird Labs LLC. All rights reserved.
+    Copyright (c) 2014-2017 Wirebird Labs LLC. All rights reserved.
 
     Permission is hereby granted, free of charge, to any person obtaining a copy
     of this software and associated documentation files (the "Software"),
@@ -28,112 +28,139 @@ void *ftw_malloc(size_t sz)
     return DSNewPtr(sz);
 }
 
-MgErr ftw_free(void *ptr)
+ftwrc ftw_free(void *ptr)
 {
-    return DSDisposePtr(ptr);
+    MgErr lvrc;
+
+    lvrc = DSDisposePtr(ptr);
+
+    return (lvrc ? lvrc + ELVMGRBASE : EFTWOK);
 }
 
-char * ftw_support_LStrHandle_to_CStr(LStrHandle src)
+char *ftw_support_LStrHandle_to_CStr(LStrHandle src)
 {
     char *s;
     size_t len;
 
-    if (src == NULL)
+    if (src == NULL) {
         return NULL;
+    }
 
     len = LHStrLen(src);
 
     s = ftw_malloc(len + 1);
-    if (s == NULL)
+    if (s == NULL) {
         return NULL;
+    }
 
-	memcpy (s, LHStrBuf(src), len);
+    MoveBlock(LHStrBuf(src), s, len);
     s[len] = '\0';
 
     return s;
 }
 
-MgErr ftw_support_buffer_to_LStrHandle(LStrHandle *dest, const void *src, size_t length)
+ftwrc ftw_support_buffer_to_LStrHandle(LStrHandle *dest, const void *src, size_t length, size_t offset)
 {
-    MgErr lv_err;
+    MgErr lvrc;
+    size_t sz;
 
-    if (src == NULL)
-        return mgArgErr;
-
-    lv_err = NumericArrayResize(uB, 1, (UHandle *)dest, length);
-
-    if (lv_err == mgNoErr) {
-        ftw_assert(dest && *dest);
-        MoveBlock(src, LHStrBuf(*dest), length);
-        (**dest)->cnt = (int32)length;
+    if (src == NULL) {
+        return EFTWARG;
     }
-    return lv_err;
+
+    lvrc = NumericArrayResize(uB, 1, (UHandle *)dest, length + offset);
+    if (lvrc != mgNoErr) {
+        return ELVMGRBASE + lvrc;
+    }
+
+    ftw_assert(dest && *dest);
+    sz = DSGetHandleSize(*dest);
+    ftw_assert(sz == length + offset + sizeof(int32));
+    MoveBlock(src, LHStrBuf(*dest) + offset, length);
+    (**dest)->cnt = (int32) (length + offset);
+
+    return EFTWOK;
 }
 
-MgErr ftw_support_CStr_to_LStrHandle(LStrHandle *dest, const char *src, size_t max_length)
+ftwrc ftw_support_CStr_to_LStrHandle(LStrHandle *dest, const char *src, size_t max_length)
 {
-    MgErr lv_err;
+    ftwrc rc;
     size_t len;
 
-    if (src == NULL)
-        return mgArgErr;
+    if (src == NULL) {
+        return EFTWARG;
+    }
 
     len = strnlen(src, max_length);
-    lv_err = ftw_support_buffer_to_LStrHandle(dest, src, len);
+    rc = ftw_support_buffer_to_LStrHandle(dest, src, len, 0);
 
-    return lv_err;
+    return rc;
 }
 
-MgErr ftw_support_expand_LStrHandleArray(LStrHandleArray ***arr, size_t elements)
+ftwrc ftw_support_expand_LStrHandleArray(LStrHandleArray ***arr, size_t elements)
 {
-    MgErr lv_err;
+    MgErr lvrc;
 
-    if (arr == NULL || *arr == NULL || **arr == NULL)
-        return mgArgErr;
+    if (arr == NULL || *arr == NULL || **arr == NULL) {
+        return EFTWARG;
+    }
 
-    lv_err = NumericArrayResize(uL, 1, (UHandle *)arr, elements);
+    lvrc = NumericArrayResize(uL, 1, (UHandle *)arr, elements);
+    if (lvrc != mgNoErr) {
+        return ELVMGRBASE + lvrc;
+    }
+    
+    (**arr)->dimsize = (int32)elements;
 
-    if (lv_err == mgNoErr)
-        (**arr)->dimsize = (int32)elements;
-
-    return lv_err;
+    return EFTWOK;
 }
 
-MgErr ftw_support_expand_PointerArray(PointerArray ***arr, size_t elements)
+ftwrc ftw_support_expand_PointerArray(PointerArray ***arr, size_t elements)
 {
-    MgErr lv_err;
+    MgErr lvrc;
     int32 sz;
 
-    if (arr == NULL || *arr == NULL || **arr == NULL)
-        return mgArgErr;
+    if (arr == NULL || *arr == NULL || **arr == NULL) {
+        return EFTWARG;
+    }
 
     FTW_COMPILER_ASSERT(sizeof(void*) == 8 || sizeof(void*) == 4);
     
-    if (sizeof(void*) == 8)
+    switch (sizeof(void*)) {
+    case 8:
         sz = uQ;
-    else if (sizeof(void*) == 4)
+        break;
+    case 4:
         sz = uL;
-    else
+        break;
+    default:
         ftw_assert_unreachable("Compiler assertion failed.");
+    }
 
-    lv_err = NumericArrayResize(sz, 1, (UHandle *)arr, elements);
-    if (lv_err == mgNoErr)
-        (**arr)->dimsize = (int32)elements;
+    lvrc = NumericArrayResize(sz, 1, (UHandle *)arr, elements);
+    if (lvrc != mgNoErr) {
+        return ELVMGRBASE + lvrc;
+    }
 
-    return lv_err;
+    (**arr)->dimsize = (int32)elements;
+
+    return EFTWOK;
 }
 
-MgErr ftw_support_expand_int32Array(int32Array ***arr, size_t elements)
+ftwrc ftw_support_expand_int32Array(int32Array ***arr, size_t elements)
 {
-    MgErr lv_err;
+    MgErr lvrc;
 
-    if (arr == NULL || *arr == NULL || **arr == NULL)
-        return mgArgErr;
+    if (arr == NULL || *arr == NULL || **arr == NULL) {
+        return EFTWARG;
+    }
 
-    lv_err = NumericArrayResize(uL, 1, (UHandle *)arr, elements);
+    lvrc = NumericArrayResize(uL, 1, (UHandle *)arr, elements);
+    if (lvrc != mgNoErr) {
+        return ELVMGRBASE + lvrc;
+    }
 
-    if (lv_err == mgNoErr)
-        (**arr)->dimsize = (int32)elements;
+    (**arr)->dimsize = (int32)elements;
 
-    return lv_err;
+    return EFTWOK;
 }
